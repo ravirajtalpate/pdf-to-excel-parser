@@ -1,98 +1,75 @@
-# Updated extractor.py with generalized parsing, raw dump handling, and flexible logic
-import re
-import argparse
-from pathlib import Path
-import pandas as pd
 import pdfplumber
-import logging
-import datetime
+import pandas as pd
+import re
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+# ---------------------------------------------------------
+# STEP 1: EXTRACT ALL RAW TEXT FROM PDF
+# ---------------------------------------------------------
 
-def extract_text_from_pdf(pdf_path):
-    logging.info(f"Extracting text from: {pdf_path}")
-    all_text = []
+def extract_pdf_text(pdf_path):
+    full_text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            txt = page.extract_text()
-            if txt:
-                all_text.append(txt)
-    return "\n".join(all_text)
+            full_text += page.extract_text() + "\n"
+    return full_text
 
-# NEW: Generic key-value detector
-def detect_key_value_lines(text):
-    rows = []
-    lines = text.split("\n")
-    kv_pattern = re.compile(r"^([^:]+):\s*(.*)$")
+
+# ---------------------------------------------------------
+# STEP 2: IDENTIFY KEY:VALUE PAIRS
+# This is generic logic since your actual data PDF is missing.
+# Adjust regex when you upload the real PDF.
+# ---------------------------------------------------------
+
+def extract_key_value_pairs(text):
+    pairs = []
+    comments = []
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
     for line in lines:
-        m = kv_pattern.match(line.strip())
-        if m:
-            key = m.group(1).strip()
-            value = m.group(2).strip()
-            rows.append({"Key": key, "Value": value, "Comments": "Detected from generic key:value structure"})
-    return rows
+        # Try simple key:value detection
+        if ":" in line:
+            key, value = line.split(":", 1)
+            pairs.append((key.strip(), value.strip()))
+            comments.append("")  # no comment for direct match
+        else:
+            # Non key:value lines → put as comment-only rows
+            pairs.append(("", ""))
+            comments.append(line)
 
-# NEW: Flexible extraction of dates, numbers, names
-def detect_patterns(text):
-    rows = []
-
-    # Date detection
-    date_patterns = [
-        r"\b\d{4}-\d{2}-\d{2}\b",
-        r"\b\d{1,2} [A-Za-z]+ \d{4}\b",
-        r"[A-Za-z]+ \d{1,2}, \d{4}"
-    ]
-
-    comment = "Identified automatically from detected date patterns"
-
-    for p in date_patterns:
-        matches = re.findall(p, text)
-        for m in matches:
-            rows.append({"Key": "Detected Date", "Value": m, "Comments": comment})
-
-    # Number detection (years, amounts)
-    num_matches = re.findall(r"\b\d{4}\b", text)
-    for n in num_matches:
-        rows.append({"Key": "Detected Number", "Value": n, "Comments": "Auto-detected numeric entity"})
-
-    return rows
-
-# NEW: Raw dump fallback
-def raw_dump_section(text):
-    return [{"Key": "RAW_TEXT", "Value": text, "Comments": "Unprocessed content dump (100% capture)"}]
-
-# Master builder
-def build_rows_from_text(text):
-    rows = []
-    rows.extend(detect_key_value_lines(text))
-    rows.extend(detect_patterns(text))
-    rows.extend(raw_dump_section(text))
-    return rows
+    return pairs, comments
 
 
-def run(pdf_path, output_xlsx):
-    text = extract_text_from_pdf(pdf_path)
+# ---------------------------------------------------------
+# STEP 3: SAVE INTO OUTPUT EXCEL
+# ---------------------------------------------------------
 
-    rows = build_rows_from_text(text)
-    df = pd.DataFrame(rows)[["Key", "Value", "Comments"]]
+def save_to_excel(pairs, comments, output_path):
+    df = pd.DataFrame({
+        "Key": [p[0] for p in pairs],
+        "Value": [p[1] for p in pairs],
+        "Comments": comments
+    })
 
-    out_path = Path(output_xlsx)
-    df.to_excel(out_path, index=False)
-    logging.info(f"Saved structured Excel to {out_path.resolve()}")
-    return df
+    df.to_excel(output_path, index=False)
+    print("Saved:", output_path)
+
+
+# ---------------------------------------------------------
+# MAIN PIPELINE
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pdf", "-p", type=str, required=True, help="Path to input PDF")
-    parser.add_argument("--out", "-o", type=str, default="Output.xlsx", help="Output Excel path")
-    args = parser.parse_args()
+    pdf_path = "Data Input.pdf"       # change when you upload it
+    output_path = "Output.xlsx"
 
-    pdf_path = Path(args.pdf)
-    if not pdf_path.exists():
-        logging.error(f"PDF not found: {pdf_path}")
-        raise SystemExit(1)
+    print("Extracting text...")
+    text = extract_pdf_text(pdf_path)
 
-    df = run(pdf_path, args.out)
-    print("\nPreview of output:\n")
-    print(df.to_string(index=False))
+    print("Extracting key:value pairs...")
+    pairs, comments = extract_key_value_pairs(text)
+
+    print("Saving output...")
+    save_to_excel(pairs, comments, output_path)
+
+    print("Done.")
