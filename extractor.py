@@ -1,361 +1,202 @@
 """
-AI-Powered Document Structuring & Data Extraction
-Converts unstructured PDF documents into structured Excel output
+pdf_to_excel.py
+
+Simple, dependency-light PDF -> Excel extractor following the assignment rules:
+- Extracts raw text from PDF
+- Uses heuristic rules to detect key:value pairs (preserves original wording)
+- Collects additional contextual lines into a "Comments" field
+- Writes a well-formatted Excel file
+
+Usage (CLI):
+    python pdf_to_excel.py input.pdf output.xlsx
+
+Or import functions in another script / Streamlit app.
 """
+import sys
+import re
+import os
+from typing import List, Dict
+import json
 
 import PyPDF2
 import pandas as pd
-import re
-from typing import List, Dict, Tuple
-import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-import anthropic
-import os
-import json
+from openpyxl import load_workbook
 
-class PDFToExcelExtractor:
-    def __init__(self, pdf_path: str, api_key: str = None):
-        """
-        Initialize the PDF to Excel extractor
-        
-        Args:
-            pdf_path: Path to input PDF file
-            api_key: Anthropic API key (optional, will use env variable if not provided)
-        """
-        self.pdf_path = pdf_path
-        self.api_key = api_key or os.getenv('ANTHROPIC_API_KEY')
-        self.client = anthropic.Anthropic(api_key=self.api_key)
-        
-    def extract_text_from_pdf(self) -> str:
-        """Extract all text content from PDF"""
-        text = ""
-        try:
-            with open(self.pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-        except Exception as e:
-            print(f"Error extracting PDF: {e}")
-            raise
-        return text
-    
-    def structure_data_with_ai(self, pdf_text: str) -> List[Dict]:
-        """
-        Use Claude AI to structure the unstructured PDF text into key-value pairs
-        
-        Args:
-            pdf_text: Raw text extracted from PDF
-            
-        Returns:
-            List of dictionaries with Key, Value, and Comments
-        """
-        prompt = f"""You are an expert data extraction assistant. Your task is to analyze the following unstructured text from a PDF document and convert it into a structured format.
+# --- Text extraction -------------------------------------------------------
+def extract_text_from_pdf(path: str) -> str:
+    """Extract full text from PDF. Returns one big string with newline separators."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Input file not found: {path}")
+    text_parts = []
+    with open(path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            text_parts.append(page_text)
+    return "\n".join(text_parts)
 
-CRITICAL REQUIREMENTS:
-1. Extract ALL information - nothing should be lost or omitted
-2. Identify logical key-value relationships in the text
-3. Create structured key-value pairs where:
-   - **Key**: A clear, descriptive label (e.g., "12th standard pass out year", "Undergraduate degree")
-   - **Value**: The core data/fact (e.g., "2007", "B.Tech (Computer Science)")
-   - **Comments**: ALL remaining descriptive text, achievements, context, explanations, or elaborations related to that key-value pair
-4. Preserve the EXACT original wording from the PDF - do not paraphrase
-5. Handle multi-line or complex text structures faithfully
 
-COMMENTS FIELD RULES (VERY IMPORTANT):
-- The Comments field should contain ALL additional information beyond the simple key-value pair
-- Include descriptions, achievements, rankings, scores, contextual details, explanations
-- If there are multiple sentences about a topic, ALL of them go in Comments
-- Examples:
-  * For education: Include subjects studied, rankings, honors, class performance
-  * For certifications: Include scores, years obtained, achievement levels, ratings
-  * For skills: Include proficiency levels, specific tools, expertise ratings
-- Comments should be substantial and informative, NOT empty unless truly no context exists
-- Preserve exact wording from the PDF in Comments
+# --- Heuristic key:value parsing ------------------------------------------
+KEY_COLON_RE = re.compile(r'^\s*([A-Za-z0-9][A-Za-z0-9 .&()/\-]{0,80}?)\s*:\s*(.+)$')
+# fallback: lines that look like "Name — value" or "Name - value"
+KEY_DASH_RE = re.compile(r'^\s*([A-Za-z0-9][A-Za-z0-9 .&()/\-]{0,80}?)\s+[—\-–]\s+(.+)$')
 
-EXAMPLE FORMAT:
-If PDF says: "Passed 12th standard in 2007 with 92.50% score. His core subjects included Mathematics, Physics, Chemistry, and Computer Science, demonstrating his early aptitude for technical fields. This was an outstanding achievement."
+def detect_key_line(line: str):
+    """Return (key, value) if the line looks like a key:value line, else None."""
+    m = KEY_COLON_RE.match(line)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m2 = KEY_DASH_RE.match(line)
+    if m2:
+        return m2.group(1).strip(), m2.group(2).strip()
+    return None
 
-Extract as:
-{{
-    "Key": "12th standard pass out year",
-    "Value": "2007",
-    "Comments": "His core subjects included Mathematics, Physics, Chemistry, and Computer Science, demonstrating his early aptitude for technical fields."
-}},
-{{
-    "Key": "12th overall board score",
-    "Value": "92.50%",
-    "Comments": "Outstanding achievement"
-}}
+def parse_text_to_pairs(raw_text: str) -> List[Dict]:
+    """
+    Convert raw_text to a list of {Key, Value, Comments}.
+    Heuristics:
+      - Lines with colon or dash separate keys and values.
+      - Lines without keys are appended as comments to the current item.
+      - If a long block appears with no obvious keys, we create a single 'Full text' record.
+    """
+    lines = [ln.rstrip() for ln in raw_text.splitlines()]
+    items = []
+    current = None
 
-For educational/professional records, use keys like:
-- "12th standard pass out year"
-- "12th overall board score"
-- "Undergraduate degree"
-- "Undergraduate college"
-- "Undergraduate year"
-- "Undergraduate CGPA"
-- "Graduation degree"
-- "Graduation college"
-- "Graduation year"
-- "Graduation CGPA"
-- "Certifications 1", "Certifications 2", "Certifications 3", "Certifications 4"
-- "Technical Proficiency"
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            # empty line -> treat as paragraph separator: keep but as newline in comments
+            if current is not None:
+                current['Comments'] += "\n"
+            continue
 
-PDF TEXT TO ANALYZE:
-{pdf_text}
+        kv = detect_key_line(ln)
+        if kv:
+            # start new item
+            key, val = kv
+            # finalize previous
+            if current:
+                items.append(current)
+            current = {"Key": key, "Value": val, "Comments": ""}
+            continue
 
-OUTPUT FORMAT:
-Return a JSON array where each element has this structure:
-{{
-    "Key": "descriptive key name",
-    "Value": "extracted value",
-    "Comments": "ALL additional context, descriptions, achievements, or notes"
-}}
+        # If line looks like an "All caps header" and next line is descriptive, treat as key
+        if ln.strip().isupper() and i + 1 < len(lines) and lines[i+1].strip():
+            # use the next non-empty line as value if it doesn't look like a key
+            nxt = lines[i+1].strip()
+            if not detect_key_line(nxt):
+                if current:
+                    items.append(current)
+                current = {"Key": ln.strip().title(), "Value": nxt, "Comments": ""}
+                # skip the next line (we already used it)
+                continue
 
-CRITICAL REMINDERS:
-- Return ONLY the JSON array, no other text or markdown
-- Ensure 100% of the PDF content is captured across all fields (Key, Value, Comments)
-- Comments should be rich and detailed, NOT empty
-- Maintain original language and phrasing
-- Number similar keys (e.g., Certifications 1, Certifications 2, Certifications 3)
-"""
+        # If no key detected, append line to comments of current item if exists
+        if current is not None:
+            if current['Comments']:
+                current['Comments'] += "\n" + ln
+            else:
+                current['Comments'] = ln
+        else:
+            # no current item: create a fallback "Unstructured" item
+            current = {"Key": "Unstructured", "Value": "", "Comments": ln}
 
-        try:
-            message = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=8000,  # Increased for better comment extraction
-                temperature=0,  # More deterministic output
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            # Extract the text response
-            response_text = message.content[0].text
-            
-            # Clean up the response - remove markdown code blocks if present
-            response_text = response_text.strip()
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.startswith("```"):
-                response_text = response_text[3:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            response_text = response_text.strip()
-            
-            # Parse JSON response
-            structured_data = json.loads(response_text)
-            
-            # Validate and enhance comments
-            for item in structured_data:
-                # Ensure all required fields exist
-                if 'Key' not in item or 'Value' not in item:
-                    print(f"Warning: Incomplete item found: {item}")
-                    continue
-                
-                # Ensure Comments field exists
-                if 'Comments' not in item:
-                    item['Comments'] = ""
-                
-                # Debug output
-                print(f"✓ {item['Key']}: {item['Value'][:50] if len(str(item['Value'])) > 50 else item['Value']}")
-                if item['Comments']:
-                    print(f"  └─ Comment: {item['Comments'][:100]}...")
-            
-            return structured_data
-            
-        except Exception as e:
-            print(f"Error in AI structuring: {e}")
-            raise
-    
-    def enhance_comments(self, structured_data: List[Dict], pdf_text: str) -> List[Dict]:
-        """
-        Second pass: Enhance comments with more context from the PDF
-        
-        Args:
-            structured_data: Initial structured data
-            pdf_text: Original PDF text
-            
-        Returns:
-            Enhanced structured data with richer comments
-        """
-        # Create a summary of extracted data
-        data_summary = "\n".join([f"{item['Key']}: {item['Value']}" for item in structured_data])
-        
-        prompt = f"""You have extracted key-value pairs from a document. Now review the ORIGINAL text and ENHANCE the Comments field for each item.
+    # finalize last
+    if current:
+        items.append(current)
 
-ORIGINAL PDF TEXT:
-{pdf_text}
+    # Post-process: ensure Value is not empty where possible by pulling small first sentences into Value if Key looked like a heading
+    for item in items:
+        if not item['Value']:
+            # try to split comments into a first-line value + rest comments if sensible
+            if item['Comments']:
+                split_lines = item['Comments'].splitlines()
+                if len(split_lines) >= 1 and len(split_lines[0]) < 120:
+                    candidate = split_lines[0].strip()
+                    # move candidate to Value
+                    item['Value'] = candidate
+                    rest = "\n".join(split_lines[1:]).strip()
+                    item['Comments'] = rest
 
-CURRENTLY EXTRACTED DATA:
-{json.dumps(structured_data, indent=2)}
+    # Number duplicate keys like "Certifications 1, 2"
+    key_count = {}
+    for it in items:
+        k = it['Key']
+        key_count.setdefault(k, 0)
+        key_count[k] += 1
+        if key_count[k] > 1:
+            it['Key'] = f"{k} {key_count[k]}"
 
-TASK:
-For each item in the extracted data, find ALL related contextual information from the original PDF text and add it to the Comments field. 
+    return items
 
-RULES FOR COMMENTS:
-1. Include achievements, rankings, scores, descriptions, explanations
-2. Include any elaboration or detail about the key-value pair
-3. Use EXACT wording from the original PDF
-4. If multiple sentences relate to an item, include ALL of them
-5. Comments should be substantial and informative
 
-Return the COMPLETE JSON array with enhanced Comments fields. Keep the same structure:
-{{
-    "Key": "same as before",
-    "Value": "same as before",
-    "Comments": "ENHANCED with all contextual information from PDF"
-}}
+# --- Excel output ----------------------------------------------------------
+def create_excel_output(structured_data: List[Dict], output_path: str):
+    """
+    Create an Excel file with columns: #, Key, Value, Comments
+    Styles header and wraps text for comments.
+    """
+    df = pd.DataFrame(structured_data)
+    # ensure columns presence
+    for col in ("Key", "Value", "Comments"):
+        if col not in df.columns:
+            df[col] = ""
 
-Return ONLY the JSON array, no other text."""
+    df = df[["Key", "Value", "Comments"]]
+    df.insert(0, "#", range(1, 1 + len(df)))
 
-        try:
-            message = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=8000,
-                temperature=0,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            response_text = message.content[0].text.strip()
-            
-            # Clean up response
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.startswith("```"):
-                response_text = response_text[3:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-            response_text = response_text.strip()
-            
-            enhanced_data = json.loads(response_text)
-            
-            print("\n📝 Comments Enhancement Complete:")
-            for item in enhanced_data:
-                if item.get('Comments'):
-                    print(f"✓ Enhanced {item['Key']}")
-            
-            return enhanced_data
-            
-        except Exception as e:
-            print(f"Warning: Could not enhance comments: {e}")
-            return structured_data  # Return original if enhancement fails
-    
-        """
-        Create formatted Excel file from structured data
-        
-        Args:
-            structured_data: List of dictionaries with Key, Value, Comments
-            output_path: Path for output Excel file
-        """
-        # Create DataFrame
-        df = pd.DataFrame(structured_data)
-        
-        # Ensure columns are in the correct order
-        df = df[['Key', 'Value', 'Comments']]
-        
-        # Add row numbers (starting from 23 to match the screenshot)
-        df.insert(0, '#', range(23, 23 + len(df)))
-        
-        # Create Excel writer
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Output', index=False, startrow=1)
-            
-            # Get the workbook and worksheet
-            workbook = writer.book
-            worksheet = writer.sheets['Output']
-            
-            # Style the header row
-            header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
-            header_font = Font(bold=True, size=11)
-            border = Border(
-                left=Side(style='thin'),
-                right=Side(style='thin'),
-                top=Side(style='thin'),
-                bottom=Side(style='thin')
-            )
-            
-            # Apply header styling
-            for cell in worksheet[2]:  # Header is in row 2
-                cell.fill = header_fill
-                cell.font = header_font
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Output", index=False, startrow=1)
+        workbook = writer.book
+        worksheet = writer.sheets["Output"]
+
+        # header row styling (row 2 because we started at startrow=1)
+        header_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
+        header_font = Font(bold=True, size=11)
+        border = Border(left=Side(style="thin"), right=Side(style="thin"),
+                        top=Side(style="thin"), bottom=Side(style="thin"))
+
+        for cell in worksheet[2]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # apply borders and wrap to data rows
+        for row in worksheet.iter_rows(min_row=3, max_row=worksheet.max_row, min_col=1, max_col=4):
+            for cell in row:
                 cell.border = border
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-            
-            # Apply borders to all data cells
-            for row in worksheet.iter_rows(min_row=3, max_row=worksheet.max_row, min_col=1, max_col=4):
-                for cell in row:
-                    cell.border = border
-                    cell.alignment = Alignment(vertical='top', wrap_text=True)
-            
-            # Adjust column widths
-            worksheet.column_dimensions['A'].width = 5   # #
-            worksheet.column_dimensions['B'].width = 30  # Key
-            worksheet.column_dimensions['C'].width = 40  # Value
-            worksheet.column_dimensions['D'].width = 80  # Comments
-            
-        print(f"Excel file created successfully: {output_path}")
-    
-    def process(self, output_path: str = "Output.xlsx"):
-        """
-        Complete processing pipeline: PDF -> AI Structuring -> Excel
-        
-        Args:
-            output_path: Path for output Excel file
-        """
-        print("Step 1: Extracting text from PDF...")
-        pdf_text = self.extract_text_from_pdf()
-        print(f"Extracted {len(pdf_text)} characters from PDF")
-        
-        print("\nStep 2: Structuring data with AI...")
-        structured_data = self.structure_data_with_ai(pdf_text)
-        print(f"Extracted {len(structured_data)} key-value pairs")
-        
-        print("\nStep 3: Creating Excel output...")
-        self.create_excel_output(structured_data, output_path)
-        print("\n✓ Process completed successfully!")
-        
-        return structured_data
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+        # reasonable widths
+        worksheet.column_dimensions["A"].width = 5
+        worksheet.column_dimensions["B"].width = 30
+        worksheet.column_dimensions["C"].width = 40
+        worksheet.column_dimensions["D"].width = 80
+
+    print(f"Excel written: {output_path}")
 
 
-def main():
-    """Main execution function"""
-    # Configuration
-    PDF_INPUT = "Data Input.pdf"
-    EXCEL_OUTPUT = "Output.xlsx"
-    
-    # Check for API key
-    api_key = os.getenv('ANTHROPIC_API_KEY')
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY environment variable not set!")
-        print("Please set it using: export ANTHROPIC_API_KEY='your-api-key'")
-        return
-    
-    # Check if input file exists
-    if not os.path.exists(PDF_INPUT):
-        print(f"ERROR: Input file '{PDF_INPUT}' not found!")
-        return
-    
-    try:
-        # Initialize and process
-        extractor = PDFToExcelExtractor(PDF_INPUT, api_key)
-        structured_data = extractor.process(EXCEL_OUTPUT)
-        
-        # Display summary
-        print("\n" + "="*60)
-        print("EXTRACTION SUMMARY")
-        print("="*60)
-        print(f"Total records extracted: {len(structured_data)}")
-        print(f"Output file: {EXCEL_OUTPUT}")
-        print("="*60)
-        
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        import traceback
-        traceback.print_exc()
-
+# --- CLI runner ------------------------------------------------------------
+def process_pdf_to_excel(input_pdf: str, output_xlsx: str):
+    print(f"Extracting text from: {input_pdf}")
+    raw = extract_text_from_pdf(input_pdf)
+    print(f"Extracted {len(raw)} characters.")
+    structured = parse_text_to_pairs(raw)
+    print(f"Detected {len(structured)} records.")
+    create_excel_output(structured, output_xlsx)
+    # Also save JSON copy
+    json_path = os.path.splitext(output_xlsx)[0] + ".json"
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(structured, jf, indent=2, ensure_ascii=False)
+    print(f"JSON written: {json_path}")
+    return structured
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 3:
+        print("Usage: python pdf_to_excel.py input.pdf output.xlsx")
+        sys.exit(1)
+    inp = sys.argv[1]
+    outp = sys.argv[2]
+    process_pdf_to_excel(inp, outp)
