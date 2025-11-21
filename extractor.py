@@ -51,30 +51,57 @@ class PDFToExcelExtractor:
         """
         prompt = f"""You are an expert data extraction assistant. Your task is to analyze the following unstructured text from a PDF document and convert it into a structured format.
 
-REQUIREMENTS:
+CRITICAL REQUIREMENTS:
 1. Extract ALL information - nothing should be lost or omitted
 2. Identify logical key-value relationships in the text
 3. Create structured key-value pairs where:
-   - Key: A clear, descriptive label for the information
-   - Value: The actual data/information
-   - Comments: Additional contextual information, explanations, or related details
-4. Preserve the EXACT original wording from the PDF - do not paraphrase unless necessary to form a clean key-value pair
+   - **Key**: A clear, descriptive label (e.g., "12th standard pass out year", "Undergraduate degree")
+   - **Value**: The core data/fact (e.g., "2007", "B.Tech (Computer Science)")
+   - **Comments**: ALL remaining descriptive text, achievements, context, explanations, or elaborations related to that key-value pair
+4. Preserve the EXACT original wording from the PDF - do not paraphrase
 5. Handle multi-line or complex text structures faithfully
-6. For educational/professional records, use keys like:
-   - "12th standard pass out year"
-   - "12th overall board score"
-   - "Undergraduate degree"
-   - "Undergraduate college"
-   - "Undergraduate year"
-   - "Undergraduate CGPA"
-   - "Graduation degree"
-   - "Graduation college"
-   - "Graduation year"
-   - "Graduation CGPA"
-   - "Certifications 1", "Certifications 2", etc.
-   - "Technical Proficiency"
 
-PDF TEXT:
+COMMENTS FIELD RULES (VERY IMPORTANT):
+- The Comments field should contain ALL additional information beyond the simple key-value pair
+- Include descriptions, achievements, rankings, scores, contextual details, explanations
+- If there are multiple sentences about a topic, ALL of them go in Comments
+- Examples:
+  * For education: Include subjects studied, rankings, honors, class performance
+  * For certifications: Include scores, years obtained, achievement levels, ratings
+  * For skills: Include proficiency levels, specific tools, expertise ratings
+- Comments should be substantial and informative, NOT empty unless truly no context exists
+- Preserve exact wording from the PDF in Comments
+
+EXAMPLE FORMAT:
+If PDF says: "Passed 12th standard in 2007 with 92.50% score. His core subjects included Mathematics, Physics, Chemistry, and Computer Science, demonstrating his early aptitude for technical fields. This was an outstanding achievement."
+
+Extract as:
+{{
+    "Key": "12th standard pass out year",
+    "Value": "2007",
+    "Comments": "His core subjects included Mathematics, Physics, Chemistry, and Computer Science, demonstrating his early aptitude for technical fields."
+}},
+{{
+    "Key": "12th overall board score",
+    "Value": "92.50%",
+    "Comments": "Outstanding achievement"
+}}
+
+For educational/professional records, use keys like:
+- "12th standard pass out year"
+- "12th overall board score"
+- "Undergraduate degree"
+- "Undergraduate college"
+- "Undergraduate year"
+- "Undergraduate CGPA"
+- "Graduation degree"
+- "Graduation college"
+- "Graduation year"
+- "Graduation CGPA"
+- "Certifications 1", "Certifications 2", "Certifications 3", "Certifications 4"
+- "Technical Proficiency"
+
+PDF TEXT TO ANALYZE:
 {pdf_text}
 
 OUTPUT FORMAT:
@@ -82,20 +109,22 @@ Return a JSON array where each element has this structure:
 {{
     "Key": "descriptive key name",
     "Value": "extracted value",
-    "Comments": "additional context or notes (can be empty string if no context)"
+    "Comments": "ALL additional context, descriptions, achievements, or notes"
 }}
 
-Important:
-- Return ONLY the JSON array, no other text
-- Ensure 100% of the PDF content is captured
+CRITICAL REMINDERS:
+- Return ONLY the JSON array, no other text or markdown
+- Ensure 100% of the PDF content is captured across all fields (Key, Value, Comments)
+- Comments should be rich and detailed, NOT empty
 - Maintain original language and phrasing
-- Number similar keys (e.g., Certifications 1, Certifications 2)
+- Number similar keys (e.g., Certifications 1, Certifications 2, Certifications 3)
 """
 
         try:
             message = self.client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=4000,
+                max_tokens=8000,  # Increased for better comment extraction
+                temperature=0,  # More deterministic output
                 messages=[
                     {"role": "user", "content": prompt}
                 ]
@@ -117,13 +146,103 @@ Important:
             # Parse JSON response
             structured_data = json.loads(response_text)
             
+            # Validate and enhance comments
+            for item in structured_data:
+                # Ensure all required fields exist
+                if 'Key' not in item or 'Value' not in item:
+                    print(f"Warning: Incomplete item found: {item}")
+                    continue
+                
+                # Ensure Comments field exists
+                if 'Comments' not in item:
+                    item['Comments'] = ""
+                
+                # Debug output
+                print(f"✓ {item['Key']}: {item['Value'][:50] if len(str(item['Value'])) > 50 else item['Value']}")
+                if item['Comments']:
+                    print(f"  └─ Comment: {item['Comments'][:100]}...")
+            
             return structured_data
             
         except Exception as e:
             print(f"Error in AI structuring: {e}")
             raise
     
-    def create_excel_output(self, structured_data: List[Dict], output_path: str):
+    def enhance_comments(self, structured_data: List[Dict], pdf_text: str) -> List[Dict]:
+        """
+        Second pass: Enhance comments with more context from the PDF
+        
+        Args:
+            structured_data: Initial structured data
+            pdf_text: Original PDF text
+            
+        Returns:
+            Enhanced structured data with richer comments
+        """
+        # Create a summary of extracted data
+        data_summary = "\n".join([f"{item['Key']}: {item['Value']}" for item in structured_data])
+        
+        prompt = f"""You have extracted key-value pairs from a document. Now review the ORIGINAL text and ENHANCE the Comments field for each item.
+
+ORIGINAL PDF TEXT:
+{pdf_text}
+
+CURRENTLY EXTRACTED DATA:
+{json.dumps(structured_data, indent=2)}
+
+TASK:
+For each item in the extracted data, find ALL related contextual information from the original PDF text and add it to the Comments field. 
+
+RULES FOR COMMENTS:
+1. Include achievements, rankings, scores, descriptions, explanations
+2. Include any elaboration or detail about the key-value pair
+3. Use EXACT wording from the original PDF
+4. If multiple sentences relate to an item, include ALL of them
+5. Comments should be substantial and informative
+
+Return the COMPLETE JSON array with enhanced Comments fields. Keep the same structure:
+{{
+    "Key": "same as before",
+    "Value": "same as before",
+    "Comments": "ENHANCED with all contextual information from PDF"
+}}
+
+Return ONLY the JSON array, no other text."""
+
+        try:
+            message = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8000,
+                temperature=0,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            response_text = message.content[0].text.strip()
+            
+            # Clean up response
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            enhanced_data = json.loads(response_text)
+            
+            print("\n📝 Comments Enhancement Complete:")
+            for item in enhanced_data:
+                if item.get('Comments'):
+                    print(f"✓ Enhanced {item['Key']}")
+            
+            return enhanced_data
+            
+        except Exception as e:
+            print(f"Warning: Could not enhance comments: {e}")
+            return structured_data  # Return original if enhancement fails
+    
         """
         Create formatted Excel file from structured data
         
@@ -194,7 +313,10 @@ Important:
         structured_data = self.structure_data_with_ai(pdf_text)
         print(f"Extracted {len(structured_data)} key-value pairs")
         
-        print("\nStep 3: Creating Excel output...")
+        print("\nStep 3: Enhancing comments with contextual information...")
+        structured_data = self.enhance_comments(structured_data, pdf_text)
+        
+        print("\nStep 4: Creating Excel output...")
         self.create_excel_output(structured_data, output_path)
         print("\n✓ Process completed successfully!")
         
